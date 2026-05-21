@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -23,6 +24,14 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 )
+
+func legacyNewRootSpanOnIngest() bool {
+	switch os.Getenv("INNGEST_LEGACY_INGEST_NEW_ROOT_SPAN") {
+	case "1", "true", "TRUE", "True", "yes", "on":
+		return true
+	}
+	return false
+}
 
 // Constants set here are leveraged by start, dev, and, healthcheck commands
 const (
@@ -263,13 +272,16 @@ func (a API) ReceiveEvent(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 
-			ctx, span := itrace.UserTracer().Provider().
-				Tracer(consts.OtelScopeEvent).
-				Start(ctx, consts.OtelSpanEvent,
-					trace.WithTimestamp(ts),
+			spanOpts := []trace.SpanStartOption{trace.WithTimestamp(ts)}
+			if legacyNewRootSpanOnIngest() {
+				spanOpts = append(spanOpts,
 					trace.WithNewRoot(),
 					trace.WithLinks(trace.LinkFromContext(ctx)),
 				)
+			}
+			ctx, span := itrace.UserTracer().Provider().
+				Tracer(consts.OtelScopeEvent).
+				Start(ctx, consts.OtelSpanEvent, spanOpts...)
 			defer span.End()
 
 			seed := event.SeededIDFromString(
