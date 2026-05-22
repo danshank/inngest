@@ -244,6 +244,7 @@ type tracer struct {
 	propagator propagation.TextMapPropagator
 	shutdown   func(context.Context)
 	processor  trace.SpanProcessor
+	processors []trace.SpanProcessor
 }
 
 func (t *tracer) Provider() *trace.TracerProvider {
@@ -261,11 +262,16 @@ func (t *tracer) Shutdown(ctx context.Context) func() {
 }
 
 func (t *tracer) Export(span trace.ReadOnlySpan) error {
-	if t.processor == nil {
+	if len(t.processors) == 0 && t.processor == nil {
 		logger.StdlibLogger(context.Background()).Trace("no exporter available to export custom spans")
 		return nil
 	}
-
+	if len(t.processors) > 0 {
+		for _, p := range t.processors {
+			p.OnEnd(span)
+		}
+		return nil
+	}
 	t.processor.OnEnd(span)
 	return nil
 }
@@ -397,24 +403,72 @@ func newOTLPHTTPTraceProvider(ctx context.Context, opts TracerOpts) (Tracer, err
 	}
 
 	sp := trace.NewBatchSpanProcessor(exp, trace.WithBatchTimeout(100*time.Millisecond))
-	tp := trace.NewTracerProvider(
-		trace.WithSpanProcessor(sp),
+
+	extExp, extShutdown, err := newExternalOTLPExporter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("external OTLP trace exporter disabled: %w", err)
+	}
+	processors := []trace.SpanProcessor{sp}
+	var extSP trace.SpanProcessor
+	if extExp != nil {
+		extSP = trace.NewBatchSpanProcessor(extExp, trace.WithBatchTimeout(100*time.Millisecond))
+		processors = append(processors, extSP)
+	}
+
+	tpOpts := []trace.TracerProviderOption{
 		trace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String(opts.ServiceName),
 		)),
-	)
+	}
+	for _, p := range processors {
+		tpOpts = append(tpOpts, trace.WithSpanProcessor(p))
+	}
+	tp := trace.NewTracerProvider(tpOpts...)
 
 	return &tracer{
 		provider:   tp,
 		propagator: newTextMapPropagator(),
 		processor:  sp,
+		processors: processors,
 		shutdown: func(ctx context.Context) {
 			_ = tp.ForceFlush(ctx)
 			_ = exp.Shutdown(ctx)
+			if extShutdown != nil {
+				extShutdown(ctx)
+			}
 			_ = tp.Shutdown(ctx)
 		},
 	}, nil
+}
+
+func newExternalOTLPExporter(ctx context.Context) (*otlptrace.Exporter, func(context.Context), error) {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+	if endpoint == "" {
+		endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	if endpoint == "" {
+		return nil, nil, nil
+	}
+
+	// otlptracehttp wants host:port, not a full URL.
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	if i := strings.IndexByte(endpoint, '/'); i >= 0 {
+		endpoint = endpoint[:i]
+	}
+
+	client := otlptracehttp.NewClient(
+		otlptracehttp.WithEndpoint(endpoint),
+		otlptracehttp.WithURLPath("/v1/traces"),
+		otlptracehttp.WithInsecure(),
+	)
+	exp, err := otlptrace.New(ctx, client)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create external otlp exporter: %w", err)
+	}
+	shutdown := func(ctx context.Context) { _ = exp.Shutdown(ctx) }
+	return exp, shutdown, nil
 }
 
 func newOTLPGRPCTraceProvider(ctx context.Context, opts TracerOpts) (Tracer, error) {
