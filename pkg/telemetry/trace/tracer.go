@@ -13,6 +13,7 @@ import (
 	"github.com/inngest/inngest/pkg/logger"
 	"github.com/inngest/inngest/pkg/telemetry/exporters"
 	"github.com/inngest/inngest/pkg/tracing/meta"
+	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/jaeger"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
@@ -442,31 +443,18 @@ func newOTLPHTTPTraceProvider(ctx context.Context, opts TracerOpts) (Tracer, err
 	}, nil
 }
 
-func newExternalOTLPExporter(ctx context.Context) (*otlptrace.Exporter, func(context.Context), error) {
-	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-	if endpoint == "" {
-		endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	}
-	if endpoint == "" {
-		return nil, nil, nil
-	}
-
-	// otlptracehttp wants host:port, not a full URL.
-	endpoint = strings.TrimPrefix(endpoint, "http://")
-	endpoint = strings.TrimPrefix(endpoint, "https://")
-	if i := strings.IndexByte(endpoint, '/'); i >= 0 {
-		endpoint = endpoint[:i]
-	}
-
-	client := otlptracehttp.NewClient(
-		otlptracehttp.WithEndpoint(endpoint),
-		otlptracehttp.WithURLPath("/v1/traces"),
-		otlptracehttp.WithInsecure(),
-	)
-	exp, err := otlptrace.New(ctx, client)
+// newExternalOTLPExporter optionally mirrors spans to an external OTLP collector
+// configured via the standard OpenTelemetry environment variables.
+func newExternalOTLPExporter(ctx context.Context) (trace.SpanExporter, func(context.Context), error) {
+	exp, err := autoexport.NewSpanExporter(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create external otlp exporter: %w", err)
 	}
+	if autoexport.IsNoneSpanExporter(exp) {
+		_ = exp.Shutdown(ctx)
+		return nil, nil, nil
+	}
+
 	shutdown := func(ctx context.Context) { _ = exp.Shutdown(ctx) }
 	return exp, shutdown, nil
 }
